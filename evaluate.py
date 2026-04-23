@@ -93,6 +93,14 @@ TEST_CASES = [
         "intent": "Recent / light tone",
         "must_avoid": "Dark, bleak movies",
     },
+    {
+        "id": 11,
+        "preferences": "I want to watch a movie focusing on world war 2 conflicts with a heavy focus on action scenes",
+        "history": ["The Longest Day", "Bridge Over the River Kwai"],
+        "history_ids": [],
+        "intent": "WWII / historical war action",
+        "must_avoid": "Superhero or sci-fi war titles",
+    },
 ]
 
 
@@ -126,6 +134,11 @@ def quick_eval(case: dict, movie: dict) -> str:
         "dark" in metadata_text or "thriller" in genres
     ):
         return "Check: may still feel dark"
+    if "world war 2" in preferences or "wwii" in preferences or "ww2" in preferences:
+        if "war" not in genres and "history" not in genres:
+            return "Check: missed WWII/war signal"
+        if "superhero" in metadata_text or "science fiction" in genres:
+            return "Check: war prompt drifted to franchise/sci-fi"
     return "Reasonable fit"
 
 
@@ -164,6 +177,16 @@ def score_case(case: dict, movie: dict) -> tuple[int, int, int, str]:
     elif "older classic" in preferences and year > 2005:
         constraint_score = 0
         notes.append("not old/classic enough")
+    elif ("world war 2" in preferences or "wwii" in preferences or "ww2" in preferences) and (
+        "war" not in genres and "history" not in genres
+    ):
+        constraint_score = 0
+        notes.append("does not look like a WWII/war title")
+    elif ("world war 2" in preferences or "wwii" in preferences or "ww2" in preferences) and (
+        "superhero" in metadata_text or "science fiction" in genres
+    ):
+        constraint_score = 0
+        notes.append("drifted into franchise/sci-fi war wording")
 
     intent_score = 0
     if "funny" in preferences or "feel-good" in preferences:
@@ -217,6 +240,11 @@ def score_case(case: dict, movie: dict) -> tuple[int, int, int, str]:
         ):
             intent_score = 2
         elif "comedy" in genres or "family" in genres:
+            intent_score = 1
+    elif "world war 2" in preferences or "wwii" in preferences or "ww2" in preferences:
+        if "war" in genres and "action" in genres:
+            intent_score = 2
+        elif "war" in genres or "history" in genres:
             intent_score = 1
 
     history_score = 1

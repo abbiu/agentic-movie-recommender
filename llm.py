@@ -70,12 +70,13 @@ GENRE_TERMS = {
     "Drama": {"drama", "dramatic", "character-driven", "character driven"},
     "Family": {"family", "kid-friendly", "kids", "children"},
     "Fantasy": {"fantasy", "magical", "magic"},
-    "History": {"historical", "history", "period piece"},
+    "History": {"historical", "history", "period piece", "world war", "ww2", "wwii"},
     "Horror": {"gory", "horror", "scary", "terrifying"},
     "Mystery": {"detective", "mystery", "twisty", "whodunit"},
     "Romance": {"love story", "rom-com", "romance", "romantic", "romcom"},
     "Science Fiction": {"future", "sci-fi", "sci fi", "science fiction", "space"},
     "Thriller": {"suspense", "suspenseful", "tense", "thriller"},
+    "War": {"battlefront", "combat", "military", "war", "warfare", "world war", "ww2", "wwii"},
 }
 
 MOOD_TERMS = {
@@ -90,6 +91,17 @@ MOOD_TERMS = {
 
 THEME_TERMS = {
     "superhero": {"avenger", "avengers", "comic book", "dc", "marvel", "superhero", "superheroes"},
+    "world_war_ii": {
+        "allied",
+        "battle of",
+        "nazis",
+        "nazi",
+        "second world war",
+        "world war 2",
+        "world war ii",
+        "ww2",
+        "wwii",
+    },
 }
 
 NEGATION_WORDS = {"avoid", "exclude", "excluding", "no", "not", "skip", "without"}
@@ -469,6 +481,17 @@ def _theme_bonus(candidate: dict, signals: dict) -> float:
         score += 1.8
     if "superhero" in signals["avoided_themes"] and candidate["is_superhero"]:
         score -= 6.0
+    if "world_war_ii" in signals["preferred_themes"]:
+        if "War" in candidate["genres"] or "History" in candidate["genres"]:
+            score += 3.2
+        wwii_terms = THEME_TERMS["world_war_ii"]
+        if any(
+            _contains_phrase(candidate["document"], _normalize_text(term))
+            for term in wwii_terms
+        ):
+            score += 2.0
+        if candidate["is_superhero"] or "Science Fiction" in candidate["genres"]:
+            score -= 2.5
     return score
 
 
@@ -569,6 +592,13 @@ def _hard_constraint_penalty(candidate: dict, signals: dict) -> float:
         penalty -= 1.5
     if "light" in signals["preferred_moods"] and candidate["is_dark"]:
         penalty -= 2.8
+    if "world_war_ii" in signals["preferred_themes"]:
+        if "War" not in candidate["genres"] and "History" not in candidate["genres"]:
+            penalty -= 2.5
+        if candidate["is_superhero"]:
+            penalty -= 5.0
+        if candidate["title_norm"].startswith("star wars") or "warcraft" in candidate["title_norm"]:
+            penalty -= 4.0
     return penalty
 
 
