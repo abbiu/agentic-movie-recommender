@@ -23,6 +23,8 @@ MODEL = "gemma4:31b-cloud"
 MAX_DESCRIPTION_CHARS = 500
 CACHE_MAX_SIZE = 64
 TMDB_TIMEOUT_SECONDS = 4.0
+HIGH_RATING_MIN = 7.5
+MIN_RATING_VOTES = 200
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "tmdb_top1000_movies.csv")
 TOP_MOVIES = pd.read_csv(DATA_PATH)
@@ -89,6 +91,107 @@ MOOD_TERMS = {
     "light": {"easygoing", "light", "lighthearted"},
 }
 
+MUSICAL_QUERY_TERMS = {
+    "music",
+    "musical",
+    "performance",
+    "sing",
+    "singing",
+    "dance",
+    "dancing",
+}
+
+MUSICAL_CANDIDATE_TERMS = {
+    "music",
+    "musical",
+    "performance",
+    "performer",
+    "stage",
+    "concert",
+    "jazz",
+    "sing",
+    "singing",
+    "singer",
+    "dance",
+    "dancing",
+    "idol",
+}
+
+STRONG_MUSICAL_TERMS = {
+    "concert",
+    "dance",
+    "dancing",
+    "idol",
+    "jazz",
+    "performance",
+    "performer",
+    "show",
+    "singer",
+    "singing",
+    "song",
+    "stage",
+}
+
+TRAGIC_TERMS = {
+    "tragedy",
+    "tragic",
+    "tearjerker",
+    "heartbreak",
+    "heartbreaking",
+    "grief",
+    "loss",
+    "death",
+    "dying",
+    "mourning",
+    "depressing",
+    "melancholy",
+    "suicide",
+}
+
+COMFORT_TERMS = {
+    "comfort",
+    "comforting",
+    "easy watch",
+    "after work",
+    "low stress",
+    "heartwarming",
+    "warm",
+    "uplifting",
+    "cozy",
+}
+
+DATE_NIGHT_TERMS = {
+    "for couple",
+    "date night",
+    "couple",
+}
+
+FAMILY_FRIENDLY_TERMS = {
+    "family watch",
+    "family friendly",
+    "friendly for family watch",
+    "all ages",
+}
+
+CHILDISH_AVOIDANCE_TERMS = {
+    "not childish",
+    "not too childish",
+    "not kiddy",
+    "not too kiddy",
+    "not for little kids",
+}
+
+HIGH_RATED_TERMS = {
+    "high rated",
+    "high-rated",
+    "high imdb rating",
+    "high imbd rating",
+    "top rated",
+    "top-rated",
+    "critically acclaimed",
+    "acclaimed",
+}
+
 THEME_TERMS = {
     "superhero": {"avenger", "avengers", "comic book", "dc", "marvel", "superhero", "superheroes"},
     "world_war_ii": {
@@ -102,6 +205,61 @@ THEME_TERMS = {
         "ww2",
         "wwii",
     },
+}
+
+LANGUAGE_TERMS = {
+    "ar": {"arabic"},
+    "de": {"german"},
+    "en": {"american", "british", "english"},
+    "es": {"espanol", "spanish"},
+    "fr": {"french"},
+    "hi": {"hindi"},
+    "it": {"italian"},
+    "ja": {"anime", "japanese"},
+    "ko": {"korean"},
+    "pt": {"portuguese"},
+    "ru": {"russian"},
+    "zh": {"chinese", "mandarin"},
+}
+
+COUNTRY_TERMS = {
+    "australia": {"australia", "australian"},
+    "china": {"china", "chinese"},
+    "france": {"france", "french"},
+    "india": {"india", "indian", "bollywood"},
+    "italy": {"italian", "italy"},
+    "japan": {"japan", "japanese"},
+    "mexico": {"mexico", "mexican"},
+    "south korea": {"korea", "korean", "south korea"},
+    "spain": {"spain", "spanish"},
+    "united kingdom": {"britain", "british", "uk", "united kingdom"},
+    "united states of america": {"america", "american", "hollywood", "united states", "usa"},
+}
+
+TYPO_REPLACEMENTS = {
+    "imbd": "imdb",
+    "realse": "release",
+    "relase": "release",
+    "super hero": "superhero",
+    "super heros": "superheroes",
+    "superheros": "superheroes",
+    "supeheroes": "superheroes",
+    "super heroe": "superhero",
+}
+
+LANGUAGE_TO_COUNTRIES = {
+    "ar": {"arabia", "egypt", "saudi arabia", "united arab emirates"},
+    "de": {"germany", "austria"},
+    "en": {"united states of america", "united kingdom", "australia", "canada"},
+    "es": {"spain", "mexico"},
+    "fr": {"france", "belgium", "canada"},
+    "hi": {"india"},
+    "it": {"italy"},
+    "ja": {"japan"},
+    "ko": {"south korea"},
+    "pt": {"portugal", "brazil"},
+    "ru": {"russia"},
+    "zh": {"china", "hong kong", "taiwan"},
 }
 
 NEGATION_WORDS = {"avoid", "exclude", "excluding", "no", "not", "skip", "without"}
@@ -123,6 +281,8 @@ def _normalize_text(value) -> str:
         return ""
     text = unicodedata.normalize("NFKD", str(value).casefold())
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    for typo, replacement in TYPO_REPLACEMENTS.items():
+        text = re.sub(rf"\b{re.escape(typo)}\b", replacement, text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -198,6 +358,12 @@ def _extract_preference_signals(preferences: str) -> dict:
     preferred_themes, avoided_themes = _extract_categorical_signals(
         normalized, THEME_TERMS
     )
+    preferred_languages, avoided_languages = _extract_categorical_signals(
+        normalized, LANGUAGE_TERMS
+    )
+    preferred_countries, avoided_countries = _extract_categorical_signals(
+        normalized, COUNTRY_TERMS
+    )
     return {
         "text": normalized,
         "tokens": _tokenize(normalized),
@@ -207,6 +373,32 @@ def _extract_preference_signals(preferences: str) -> dict:
         "avoided_moods": avoided_moods,
         "preferred_themes": preferred_themes,
         "avoided_themes": avoided_themes,
+        "preferred_languages": preferred_languages,
+        "avoided_languages": avoided_languages,
+        "preferred_countries": preferred_countries,
+        "avoided_countries": avoided_countries,
+        "wants_musical": any(_contains_phrase(normalized, _normalize_text(term)) for term in MUSICAL_QUERY_TERMS),
+        "wants_date_night": any(_contains_phrase(normalized, _normalize_text(term)) for term in DATE_NIGHT_TERMS),
+        "avoids_sad": any(
+            phrase in normalized
+            for phrase in (
+                "not too sad",
+                "not sad",
+                "not too tragic",
+                "not tragic",
+                "not heartbreaking",
+            )
+        ),
+        "wants_comfort": any(_contains_phrase(normalized, _normalize_text(term)) for term in COMFORT_TERMS),
+        "wants_family_friendly": any(
+            _contains_phrase(normalized, _normalize_text(term)) for term in FAMILY_FRIENDLY_TERMS
+        ),
+        "avoids_childish": any(
+            _contains_phrase(normalized, _normalize_text(term)) for term in CHILDISH_AVOIDANCE_TERMS
+        ),
+        "wants_high_rated": any(
+            _contains_phrase(normalized, _normalize_text(term)) for term in HIGH_RATED_TERMS
+        ),
         "wants_short": any(_contains_phrase(normalized, _normalize_text(term)) for term in SHORT_RUNTIME_TERMS),
         "wants_long": any(_contains_phrase(normalized, _normalize_text(term)) for term in LONG_RUNTIME_TERMS),
         "wants_fast": any(_contains_phrase(normalized, _normalize_text(term)) for term in FAST_PACED_TERMS),
@@ -350,6 +542,13 @@ def _prepare_candidates(frame: pd.DataFrame) -> list[dict]:
             "director": str(getattr(row, "director", "") or "").strip(),
             "top_cast": str(getattr(row, "top_cast", "") or "").strip(),
             "keywords": str(getattr(row, "keywords", "") or "").strip(),
+            "original_language": str(getattr(row, "original_language", "") or "").strip().lower(),
+            "countries": frozenset(
+                _normalize_text(country)
+                for country in _split_csv_field(getattr(row, "production_countries", ""))
+                if _normalize_text(country)
+            ),
+            "countries_text": str(getattr(row, "production_countries", "") or "").strip(),
             "vote_average": float(getattr(row, "vote_average", 0) or 0),
             "vote_count": float(getattr(row, "vote_count", 0) or 0),
             "popularity": float(getattr(row, "popularity", 0) or 0),
@@ -369,6 +568,41 @@ def _prepare_candidates(frame: pd.DataFrame) -> list[dict]:
                 for term in MOOD_TERMS["light"] | MOOD_TERMS["feel_good"] | MOOD_TERMS["funny"]
             ) or bool({"Comedy", "Family", "Animation"} & genres),
         }
+        candidate["is_musical"] = (
+            "Music" in genres
+            or any(
+                _contains_phrase(document, _normalize_text(term))
+                for term in MUSICAL_CANDIDATE_TERMS
+            )
+        )
+        candidate["musical_strength"] = 0.0
+        if "Music" in genres:
+            candidate["musical_strength"] += 2.5
+        strong_matches = sum(
+            1
+            for term in STRONG_MUSICAL_TERMS
+            if _contains_phrase(document, _normalize_text(term))
+        )
+        candidate["musical_strength"] += min(2.0, 0.8 * strong_matches)
+        if _contains_phrase(document, " musical "):
+            candidate["musical_strength"] += 0.4
+        candidate["is_tragic"] = any(
+            _contains_phrase(document, _normalize_text(term))
+            for term in TRAGIC_TERMS
+        )
+        candidate["is_family_friendly"] = bool({"Family", "Animation"} & genres) or any(
+            _contains_phrase(document, _normalize_text(term))
+            for term in {"family", "all ages", "kid", "kids", "children"}
+        )
+        candidate["is_childish"] = any(
+            _contains_phrase(document, _normalize_text(term))
+            for term in {"preschool", "little kids", "toy", "talking animal", "childish"}
+        )
+        candidate["is_comfort_watch"] = (
+            candidate["is_light"]
+            and not candidate["is_dark"]
+            and 0 < candidate["runtime_min"] <= 125
+        )
         candidate["quality"] = _quality_prior(
             candidate["vote_average"], candidate["vote_count"], candidate["popularity"]
         )
@@ -539,6 +773,39 @@ def _runtime_bonus(candidate: dict, signals: dict) -> float:
     return score
 
 
+def _locale_bonus(candidate: dict, signals: dict) -> float:
+    score = 0.0
+    preferred_language_countries = set().union(
+        *(LANGUAGE_TO_COUNTRIES.get(code, set()) for code in signals["preferred_languages"])
+    ) if signals["preferred_languages"] else set()
+
+    if signals["preferred_languages"]:
+        if candidate["original_language"] in signals["preferred_languages"]:
+            score += 4.0
+        elif candidate["countries"] & preferred_language_countries:
+            score += 1.8
+        else:
+            score -= 2.0
+    if candidate["original_language"] in signals["avoided_languages"]:
+        score -= 3.0
+
+    if signals["preferred_countries"]:
+        if candidate["countries"] & signals["preferred_countries"]:
+            score += 3.2
+        else:
+            score -= 1.6
+    if candidate["countries"] & signals["avoided_countries"]:
+        score -= 2.5
+    if (
+        signals["preferred_languages"]
+        and signals["preferred_countries"]
+        and candidate["original_language"] in signals["preferred_languages"]
+        and candidate["countries"] & signals["preferred_countries"]
+    ):
+        score += 1.2
+    return score
+
+
 def _year_bonus(candidate: dict, signals: dict) -> float:
     year = candidate["year"]
     score = 0.0
@@ -599,7 +866,84 @@ def _hard_constraint_penalty(candidate: dict, signals: dict) -> float:
             penalty -= 5.0
         if candidate["title_norm"].startswith("star wars") or "warcraft" in candidate["title_norm"]:
             penalty -= 4.0
+    if signals["preferred_languages"] and candidate["original_language"] not in signals["preferred_languages"]:
+        preferred_language_countries = set().union(
+            *(LANGUAGE_TO_COUNTRIES.get(code, set()) for code in signals["preferred_languages"])
+        )
+        if not (candidate["countries"] & preferred_language_countries):
+            penalty -= 2.8
+    if signals["preferred_countries"] and not (candidate["countries"] & signals["preferred_countries"]):
+        penalty -= 2.0
     return penalty
+
+
+def _special_request_bonus(candidate: dict, signals: dict) -> float:
+    score = 0.0
+
+    if signals["wants_musical"]:
+        if candidate["musical_strength"] >= 2.0:
+            score += 3.4
+        elif candidate["musical_strength"] >= 1.0:
+            score += 1.4
+        else:
+            score -= 2.2
+
+    if signals["wants_date_night"]:
+        if "Romance" in candidate["genres"] and not candidate["is_tragic"]:
+            score += 2.2
+        elif "Romance" in candidate["genres"]:
+            score += 0.6
+        if candidate["is_light"]:
+            score += 0.8
+        if candidate["is_tragic"]:
+            score -= 2.8
+
+    if signals["avoids_sad"]:
+        if candidate["is_tragic"]:
+            score -= 3.4
+        elif candidate["is_light"]:
+            score += 0.7
+
+    if signals["wants_comfort"]:
+        if candidate["is_comfort_watch"]:
+            score += 3.1
+        if candidate["runtime_min"] and candidate["runtime_min"] > 135:
+            score -= 2.4
+        if candidate["is_dark"]:
+            score -= 3.4
+        if "Drama" in candidate["genres"] and not candidate["is_light"]:
+            score -= 1.0
+
+    if signals["wants_family_friendly"]:
+        if candidate["is_family_friendly"]:
+            score += 2.2
+        else:
+            score -= 2.0
+
+    if signals["avoids_childish"]:
+        if candidate["is_childish"]:
+            score -= 1.8
+        elif "Fantasy" in candidate["genres"] or "Adventure" in candidate["genres"]:
+            score += 0.5
+
+    if signals["wants_high_rated"]:
+        if candidate["vote_average"] >= 8.0:
+            score += 1.8
+        elif candidate["vote_average"] >= 7.4:
+            score += 1.0
+        elif candidate["vote_average"] < 6.8:
+            score -= 1.4
+
+    if (
+        "Thriller" in signals["preferred_genres"]
+        and ("Horror" in signals["avoided_genres"] or "scary" in signals["avoided_moods"])
+    ):
+        if "Thriller" in candidate["genres"] and "Horror" not in candidate["genres"]:
+            score += 1.6
+        if "Horror" in candidate["genres"] or candidate["is_dark"]:
+            score -= 1.6
+
+    return score
 
 
 def _score_candidate(
@@ -617,13 +961,72 @@ def _score_candidate(
         + _theme_bonus(candidate, signals)
         + _mood_bonus(candidate, signals)
         + _runtime_bonus(candidate, signals)
+        + _locale_bonus(candidate, signals)
         + _year_bonus(candidate, signals)
         + _history_bonus(candidate, history_summary)
+        + _special_request_bonus(candidate, signals)
         + _hard_constraint_penalty(candidate, signals)
     )
 
 
-def _choose_movie(preferences: str, history: list[str], history_ids: list[int] | None = None) -> dict:
+def _geo_preference_notice(signals: dict) -> str:
+    labels: list[str] = []
+    if signals["preferred_languages"]:
+        labels.extend(sorted(signals["preferred_languages"]))
+    if signals["preferred_countries"]:
+        labels.extend(sorted(signals["preferred_countries"]))
+    if not labels:
+        return ""
+    nice = ", ".join(labels)
+    return f"I couldn't find a strong match for the requested language/country preference ({nice}) in this catalog, so this is the closest overall fit."
+
+
+def _preferred_language_country_targets(signals: dict) -> set[str]:
+    targets: set[str] = set()
+    for code in signals["preferred_languages"]:
+        targets.update(LANGUAGE_TO_COUNTRIES.get(code, set()))
+    return targets
+
+
+def _locale_pools(candidate_pool: list[dict], signals: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    language_country_targets = _preferred_language_country_targets(signals)
+
+    language_pool = []
+    if signals["preferred_languages"]:
+        language_pool = [
+            candidate
+            for candidate in candidate_pool
+            if (
+                candidate["original_language"] in signals["preferred_languages"]
+                or bool(candidate["countries"] & language_country_targets)
+            )
+        ]
+
+    country_pool = []
+    if signals["preferred_countries"]:
+        country_pool = [
+            candidate
+            for candidate in candidate_pool
+            if candidate["countries"] & signals["preferred_countries"]
+        ]
+
+    strict_pool = []
+    if signals["preferred_languages"] and signals["preferred_countries"]:
+        strict_pool = [
+            candidate
+            for candidate in candidate_pool
+            if (
+                candidate["original_language"] in signals["preferred_languages"]
+                and bool(candidate["countries"] & signals["preferred_countries"])
+            )
+        ]
+
+    return strict_pool, language_pool, country_pool
+
+
+def _choose_movie(
+    preferences: str, history: list[str], history_ids: list[int] | None = None
+) -> tuple[dict, str]:
     signals = _extract_preference_signals(preferences)
     seen_ids = _normalize_history_ids(history_ids)
     seen_titles = _normalize_history_titles(history)
@@ -643,6 +1046,18 @@ def _choose_movie(preferences: str, history: list[str], history_ids: list[int] |
             candidate_pool = CANDIDATES
     else:
         candidate_pool = CANDIDATES
+
+    geo_notice = ""
+    if signals["preferred_languages"] or signals["preferred_countries"]:
+        strict_pool, language_pool, country_pool = _locale_pools(candidate_pool, signals)
+        if strict_pool:
+            candidate_pool = strict_pool
+        elif language_pool:
+            candidate_pool = language_pool
+        elif country_pool:
+            candidate_pool = country_pool
+        else:
+            geo_notice = _geo_preference_notice(signals)
 
     ranked: list[tuple[float, dict]] = []
     for candidate in candidate_pool:
@@ -667,7 +1082,7 @@ def _choose_movie(preferences: str, history: list[str], history_ids: list[int] |
         ),
         reverse=True,
     )
-    return ranked[0][1]
+    return ranked[0][1], geo_notice
 
 
 def _truncate_text(text: str, limit: int = MAX_DESCRIPTION_CHARS) -> str:
@@ -678,6 +1093,57 @@ def _truncate_text(text: str, limit: int = MAX_DESCRIPTION_CHARS) -> str:
     if not shortened:
         shortened = cleaned[: limit - 3].rstrip(" ,;:-.")
     return f"{shortened}..."
+
+
+def _top_stars(candidate: dict, limit: int = 2) -> list[str]:
+    cast = [
+        name.strip()
+        for name in str(candidate.get("top_cast", "") or "").split(",")
+        if name.strip()
+    ]
+    return cast[:limit]
+
+
+def _metadata_intro(candidate: dict) -> str:
+    title = candidate["title"]
+    year = candidate.get("year")
+    runtime = int(candidate.get("runtime_min") or 0)
+    pieces = []
+    if year:
+        pieces.append(str(year))
+    if runtime > 0:
+        pieces.append(f"{runtime} min")
+    details = ", ".join(pieces)
+    intro = f"{title}"
+    if details:
+        intro += f" ({details})"
+
+    stars = _top_stars(candidate, limit=2)
+    if len(stars) == 2:
+        intro += f", starring {stars[0]} and {stars[1]}."
+    elif len(stars) == 1:
+        intro += f", starring {stars[0]}."
+    else:
+        intro += "."
+    return intro
+
+
+def _rating_note(candidate: dict) -> str:
+    vote_average = float(candidate.get("vote_average") or 0.0)
+    vote_count = int(float(candidate.get("vote_count") or 0.0))
+    if vote_average >= HIGH_RATING_MIN and vote_count > MIN_RATING_VOTES:
+        return f"It is highly rated at {vote_average:.1f}/10 with over {vote_count:,} TMDB votes."
+    return ""
+
+
+def _compose_blurb(candidate: dict, body: str) -> str:
+    parts = [_metadata_intro(candidate)]
+    rating_note = _rating_note(candidate)
+    if rating_note:
+        parts.append(rating_note)
+    if body:
+        parts.append(body.strip())
+    return _truncate_text(" ".join(part for part in parts if part))
 
 
 def _list_reasons(candidate: dict, preferences: str) -> list[str]:
@@ -706,7 +1172,7 @@ def _list_reasons(candidate: dict, preferences: str) -> list[str]:
     return deduped[:3]
 
 
-def _fallback_description(candidate: dict, preferences: str) -> str:
+def _fallback_description(candidate: dict, preferences: str, prefix_notice: str = "") -> str:
     reasons = _list_reasons(candidate, preferences)
     overview = candidate["overview"]
     title = candidate["title"]
@@ -721,11 +1187,15 @@ def _fallback_description(candidate: dict, preferences: str) -> str:
     if overview:
         story_sentence = overview[:180].rstrip(" .") + "."
 
-    return _truncate_text(f"{title} is a strong pick for this request. {fit_sentence} {story_sentence}")
+    prefix = f"{prefix_notice} " if prefix_notice else ""
+    body = f"{prefix}{title} is a strong pick for this request. {fit_sentence} {story_sentence}"
+    return _compose_blurb(candidate, body)
 
 
-def _build_description_prompt(candidate: dict, preferences: str) -> str:
+def _build_description_prompt(candidate: dict, preferences: str, prefix_notice: str = "") -> str:
     reasons = ", ".join(_list_reasons(candidate, preferences)) or "its strongest qualities"
+    metadata_intro = _metadata_intro(candidate)
+    rating_note = _rating_note(candidate) or "No rating note needed."
     return f"""You are writing one short persuasive movie recommendation blurb.
 
 User preferences:
@@ -740,22 +1210,29 @@ Chosen movie:
 - Tagline: {candidate["tagline"] or "None"}
 - Overview: {candidate["overview"] or "No overview available."}
 - Main fit reasons: {reasons}
+- Required intro to preserve exactly at the start of the final blurb: {metadata_intro}
+- Include this rating note only if it reads naturally and is relevant: {rating_note}
 
 Instructions:
-- Write 2 to 3 short sentences.
+- Write 1 to 2 short sentences after the required intro.
 - Explain why this movie fits the user's request.
+- If there is a catalog limitation note below, acknowledge it briefly in the first sentence.
 - Be warm and natural.
 - Do not mention TMDB IDs, scoring, ranking, or that you are an AI.
-- Keep it under 500 characters.
-- Return only the blurb text.
+- Do not repeat the title, year, runtime, stars, or rating note unless needed for fluency.
+- Keep the full final blurb under 500 characters.
+- Return only the body text that should come after the required intro and optional rating note.
+
+Catalog limitation note:
+{prefix_notice or 'none'}
 """
 
 
-def _generate_description(candidate: dict, preferences: str) -> str:
+def _generate_description(candidate: dict, preferences: str, prefix_notice: str = "") -> str:
     candidate = _enrich_candidate_with_tmdb(candidate)
     api_key = os.getenv("OLLAMA_API_KEY", "").strip()
     if not api_key:
-        return _fallback_description(candidate, preferences)
+        return _fallback_description(candidate, preferences, prefix_notice)
 
     try:
         client = ollama.Client(
@@ -764,12 +1241,14 @@ def _generate_description(candidate: dict, preferences: str) -> str:
         )
         response = client.chat(
             model=MODEL,
-            messages=[{"role": "user", "content": _build_description_prompt(candidate, preferences)}],
+            messages=[{"role": "user", "content": _build_description_prompt(candidate, preferences, prefix_notice)}],
         )
         content = str(response.message.content).strip()
-        return _truncate_text(content) or _fallback_description(candidate, preferences)
+        if not content:
+            return _fallback_description(candidate, preferences, prefix_notice)
+        return _compose_blurb(candidate, content)
     except Exception:
-        return _fallback_description(candidate, preferences)
+        return _fallback_description(candidate, preferences, prefix_notice)
 
 
 def _cache_key(
@@ -815,10 +1294,10 @@ def get_recommendation(
     if cached is not None:
         return cached
 
-    candidate = _choose_movie(preferences, history, history_ids)
+    candidate, geo_notice = _choose_movie(preferences, history, history_ids)
     result = {
         "tmdb_id": int(candidate["tmdb_id"]),
-        "description": _generate_description(candidate, preferences),
+        "description": _generate_description(candidate, preferences, geo_notice),
     }
     result["description"] = _truncate_text(str(result["description"]))
     _cache_set(recommendation_cache_key, result)

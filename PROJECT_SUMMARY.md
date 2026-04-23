@@ -2,65 +2,71 @@
 
 ## What We Built
 
-We upgraded the starter movie recommender from a simple LLM prompt into a hybrid recommendation system:
+We turned the starter recommender into a hybrid recommendation system:
 
-- Python selects the movie using deterministic ranking.
-- TF-IDF similarity helps match user preferences to movie metadata.
-- Rule-based logic handles genres, moods, exclusions, recency, runtime, and watch history.
-- Ollama writes the final recommendation blurb.
-- TMDB API enriches the selected movie with fresher metadata before the blurb is written.
-- Evaluation results are saved to `evaluation_results.csv`.
+- Python chooses the movie with deterministic ranking.
+- TF-IDF similarity matches user preferences to movie metadata.
+- Rule-based logic handles genre, tone, exclusions, runtime, recency, watch history, language, and country.
+- Ollama is used only to write the final recommendation blurb.
+- TMDB is used as an enrichment layer for the chosen movie, not as the primary candidate source.
+- Evaluation results are written to `evaluation_results.csv`.
 
-The FastAPI contract in `main.py` was left unchanged so the project remains compatible with the grader.
+The FastAPI contract in `main.py` was left unchanged so the app stays compatible with the grader.
 
 ## Key Files
 
 - `llm.py`: Main recommendation pipeline.
-- `main.py`: FastAPI app and grading contract. We did not change this.
-- `evaluate.py`: Evaluation script with 10 prompt scenarios and scoring.
+- `main.py`: FastAPI app and grader-safe API contract.
+- `evaluate.py`: Manual evaluation suite and scoring.
 - `evaluation_results.csv`: Latest evaluation output.
-- `tmdb_top1000_movies.csv`: Local candidate pool. Returned `tmdb_id`s must come from this file.
-- `.env.example`: Placeholder environment variables for API keys.
-- `test.py`: Provided grading/test script.
+- `tmdb_top1000_movies.csv`: Local candidate pool.
+- `test.py`: Provided grading script.
+- `.env.example`: Placeholder environment variables.
 
 ## Recommendation Pipeline
 
-The current system works in these steps:
+The current flow is:
 
-1. Load all movies from `tmdb_top1000_movies.csv`.
-2. Build a text document for each movie from title, genres, keywords, overview, tagline, director, and cast.
-3. Compute TF-IDF weights for the movie corpus at import time.
-4. Parse the user's preference text for:
-   - preferred genres
-   - avoided genres
-   - mood and tone words
-   - runtime hints
-   - recent or older movie hints
-   - superhero preference or exclusion
-5. Normalize watch history and exclude watched movies by:
+1. Load the local `tmdb_top1000_movies.csv` candidate pool.
+2. Build a text document per movie using title, genres, keywords, overview, tagline, director, cast, language, and country metadata.
+3. Compute TF-IDF features locally at import time.
+4. Parse the user prompt for:
+   - preferred and avoided genres
+   - mood and tone cues
+   - theme cues such as superhero and WWII
+   - runtime and recency hints
+   - language preferences
+   - country preferences
+   - musical/date-night/comfort/high-rated/family-friendly signals
+5. Normalize watch history and exclude watched titles by:
    - `tmdb_id`
-   - title
-   - punctuation/spacing-tolerant compact title keys
-6. Score remaining movies using:
+   - normalized titles
+   - compact no-space title keys for typo and punctuation tolerance
+6. Score unseen candidates with:
    - TF-IDF similarity
-   - genre match
-   - mood/tone match
-   - quality prior from ratings/popularity
-   - recency or older-movie preference
-   - watch-history affinity
-   - hard penalties for avoided traits
-7. Select the best valid movie from the local CSV.
-8. Optionally fetch live TMDB metadata for that selected movie.
-9. Ask Ollama to write a short recommendation blurb.
-10. Fall back to a deterministic description if the live API call fails.
+   - genre bonus
+   - mood bonus
+   - theme bonus
+   - runtime bonus
+   - locale bonus
+   - year bonus
+   - quality prior from `vote_average`, `vote_count`, and `popularity`
+   - special request bonuses for musical, comfort, date-night, high-rated, family-friendly, and low-scare thriller prompts
+   - hard penalties for violations such as superhero leakage, wrong locale, horror in low-scare prompts, or too-dark comfort picks
+7. Optionally narrow the pool for strong locale requests using both:
+   - `original_language`
+   - `production_countries`
+8. Select the best valid movie from the local CSV.
+9. Optionally enrich that chosen movie with TMDB details.
+10. Generate the final blurb with Ollama, or fall back to a deterministic template if Ollama is unavailable.
 
 ## TMDB API Usage
 
-TMDB is used as an enrichment layer, not as the primary candidate source.
+TMDB is used only after selection as an enrichment layer.
 
-This is important because `main.py` validates that every returned `tmdb_id` exists in `tmdb_top1000_movies.csv`. If TMDB recommends a movie outside the CSV, the API would reject it.
+This matters because `main.py` validates that the returned `tmdb_id` must already exist in `tmdb_top1000_movies.csv`. That means TMDB cannot safely expand the candidate pool without changing the grader contract.
 
-TMDB currently improves the final response by fetching:
+TMDB currently helps provide:
 
 - overview
 - tagline
@@ -70,38 +76,119 @@ TMDB currently improves the final response by fetching:
 - top cast
 - keywords
 
-Recommended environment variables:
+Supported environment variables:
 
 ```bash
 export OLLAMA_API_KEY="your_ollama_key"
 export TMDB_API_KEY="your_tmdb_key"
 ```
 
-You can also use:
+Or:
 
 ```bash
 export TMDB_BEARER_TOKEN="your_tmdb_bearer_token"
 ```
 
+## Recommendation Blurb Format
+
+The final blurb now has fixed metadata formatting before the explanation:
+
+- movie title
+- year
+- duration
+- up to 2 top stars
+
+If the movie is strongly rated and has enough support, the blurb also includes a rating note:
+
+- `vote_average >= 7.5`
+- `vote_count > 200`
+
+Example shape:
+
+```text
+La La Land (2016, 129 min), starring Ryan Gosling and Emma Stone. It is highly rated at 7.9/10 with over 17,968 TMDB votes. ...
+```
+
+This formatting is enforced in Python so it does not depend on the model remembering instructions perfectly.
+
+## Watch History Improvements
+
+We fixed a history-matching issue where user input like:
+
+```text
+spider man into the spiderverse
+```
+
+did not match:
+
+```text
+Spider-Man: Into the Spider-Verse
+```
+
+The matcher now compares:
+
+- normalized titles
+- compact no-space title keys
+
+This makes history filtering much more robust for punctuation, spacing, and light formatting differences.
+
+## Language and Country Handling
+
+Locale preference handling is now stronger than earlier versions.
+
+The recommender now:
+
+- parses language requests such as `korean`, `japanese`, `french`
+- parses country requests such as `South Korea`, `Japan`, `France`, `United States`
+- uses `original_language`
+- also uses `production_countries`
+- narrows the candidate pool when there is a strong locale request
+- falls back gracefully if the local catalog cannot satisfy that request
+
+Example:
+
+- `funny romantic movie in Korean` now returns a Korean-language, South Korea-produced match instead of a generic English romance
+
 ## Evaluation
 
-We added `evaluate.py`, which runs 10 test prompts and writes `evaluation_results.csv`.
+`evaluate.py` has been expanded from the earlier small suite into a broader manual benchmark.
 
-The evaluator checks:
+It now tests 25 scenarios, including:
 
-- whether hard constraints were respected
-- whether the result matches the user's intent
-- whether watch history was avoided
-- whether TMDB enrichment was available
-- whether the generated description visibly used TMDB metadata
+- funny / feel-good
+- dark suspense without horror
+- mature romance
+- recent serious sci-fi
+- short comfort watch
+- non-superhero action
+- animated comedy
+- older/classic request
+- scary movie
+- light and recent
+- WWII historical action
+- recent animation
+- high-rated short sci-fi
+- date-night romance that is not too sad
+- musical romance
+- family fantasy but not childish
+- thriller but not too scary
+- comfort movie after work
+- family-friendly action adventure
+- superhero + buddy dynamic
+- typo robustness
+- default English behavior
+- explicit Korean-language behavior
+- watch-history strictness
+- description quality
 
-Current scoring columns:
+Current evaluation scoring includes:
 
 - `constraint_score`
 - `intent_score`
 - `history_score`
 - `tmdb_metadata_score`
 - `description_score`
+- `description_quality_score`
 - `overall_score`
 
 Run evaluation:
@@ -118,66 +205,40 @@ OLLAMA_API_KEY="your_ollama_key" python test.py
 
 ## Current Evaluation Takeaways
 
-The recommender performs well on most tested scenarios:
+The recommender now performs well on most tested scenarios, especially:
 
-- funny / feel-good movie
-- dark suspense without horror
-- mature romance
-- recent serious sci-fi
-- short comfort watch
-- non-superhero action
-- animated and funny
-- scary movie
-- light and recent
+- superhero exclusion
+- horror vs non-horror distinction
+- watch history avoidance
+- comfort-watch handling
+- Korean language and country prompts
+- musical/date-night prompts
+- WWII prompts
+- typo robustness for some noisy inputs
 
-The main limitation is the "older classic" prompt. The CSV only contains movies from 2011 to 2026, so true classic movies are not available under the grader-safe candidate pool.
+Current examples from the updated evaluation:
 
-For that reason, the better evaluation wording is:
-
-```text
-Recommend one of the older movies available in this dataset.
-```
-
-instead of:
-
-```text
-Recommend an older classic movie.
-```
-
-## Watch History Improvements
-
-We fixed a watch-history matching issue where:
-
-```text
-spider man into the spiderverse
-```
-
-did not match:
-
-```text
-Spider-Man: Into the Spider-Verse
-```
-
-The matcher now compares both normalized titles and compact no-space title keys, so punctuation and spacing differences are handled better.
-
-Exact watched movies are excluded. Sequels or movies from the same franchise may still be recommended unless a future same-franchise avoidance feature is added.
+- `romantic movie for couple, not too sad` -> `La La Land`
+- `love story, fun, musical, for couple` -> `The Idea of You`
+- `comfort movie after work` -> `Inside Out`
+- `funny romantic movie in Korean` -> `You Are the Apple of My Eye`
 
 ## Known Limitations
 
-- The recommender cannot return movies outside `tmdb_top1000_movies.csv` without changing `main.py`.
-- True classic movie recommendations are limited by the dataset's year range.
-- TMDB improves descriptions but does not expand the candidate pool.
-- Same-franchise avoidance is not implemented yet.
-- API keys should never be committed to GitHub.
+- The recommender still cannot return movies outside `tmdb_top1000_movies.csv` without breaking the current grader contract.
+- The `older classic` case is still constrained by the dataset itself, because the CSV only contains movies from 2011 onward.
+- Same-franchise avoidance is still not implemented.
+- Some typo cases still need explicit normalization, for example misspellings like `superheros`.
+- The evaluator contains a few heuristic checks that are intentionally simple and may still over-warn on sensible results.
 
 ## Suggested Next Improvements
 
-- Add same-franchise avoidance using title prefixes or TMDB collection data.
-- Adjust the evaluation prompt for older movies to match the dataset.
-- Add a `same_franchise_score` to `evaluate.py`.
-- Add more edge-case prompts, such as:
-  - "I want animation but not Spider-Man."
-  - "I want a funny movie, but not for kids."
-  - "I want sci-fi, but not action-heavy."
-  - "I want a family movie that is not animated."
-
+- Add typo normalization for more malformed superhero and genre words.
+- Add same-franchise avoidance using title-series logic or TMDB collection data.
+- Refine the evaluator’s low-scare thriller heuristic.
+- Add a dedicated score for locale correctness.
+- Add more stress tests around:
+  - foreign-language romance
+  - sequel avoidance
+  - franchise avoidance
+  - “not for kids” vs family-friendly prompts
