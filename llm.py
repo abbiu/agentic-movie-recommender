@@ -4,6 +4,14 @@ Hybrid movie recommendation pipeline.
 Python performs candidate preparation, history filtering, lightweight
 preference parsing, TF-IDF similarity, and deterministic ranking.
 Ollama Cloud is used only to write the final short recommendation blurb.
+
+Expected environment variables:
+- OLLAMA_API_KEY
+- Optional: TMDB_API_KEY
+- Optional: TMDB_BEARER_TOKEN
+
+TMDB is used only as optional enrichment. The recommender still works
+without TMDB credentials.
 """
 
 import argparse
@@ -25,6 +33,8 @@ CACHE_MAX_SIZE = 64
 TMDB_TIMEOUT_SECONDS = 4.0
 HIGH_RATING_MIN = 7.5
 MIN_RATING_VOTES = 200
+QUERY_EXPANSION_CACHE_SIZE = 128
+QUERY_EXPANSION_NUM_PREDICT = 96
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "tmdb_top1000_movies.csv")
 TOP_MOVIES = pd.read_csv(DATA_PATH)
@@ -269,10 +279,35 @@ FAST_PACED_TERMS = {"adrenaline", "brisk", "fast paced", "fast-paced"}
 RECENT_TERMS = {"current", "latest", "modern", "new", "recent"}
 OLDER_TERMS = {"classic", "older", "old school", "retro", "throwback"}
 CLASSIC_TERMS = {"classic", "older classic", "old school", "retro"}
+GENERIC_QUERY_FILLER = {
+    "based",
+    "best",
+    "good",
+    "history",
+    "hours",
+    "like",
+    "match",
+    "matches",
+    "movie",
+    "movies",
+    "new",
+    "preferences",
+    "rated",
+    "recommend",
+    "release",
+    "released",
+    "since",
+    "similar",
+    "something",
+    "themed",
+    "theme",
+    "watch",
+}
 
 RECOMMENDATION_CACHE: OrderedDict[
     tuple[str, tuple[str, ...], tuple[int, ...]], dict[str, object]
 ] = OrderedDict()
+QUERY_EXPANSION_CACHE: OrderedDict[str, dict[str, object]] = OrderedDict()
 TMDB_DETAILS_CACHE: dict[int, dict] = {}
 
 
@@ -364,6 +399,22 @@ def _extract_preference_signals(preferences: str) -> dict:
     preferred_countries, avoided_countries = _extract_categorical_signals(
         normalized, COUNTRY_TERMS
     )
+    min_year = None
+    max_year = None
+    if year_match := re.search(r"\b(?:since|after|from)\s+(19\d{2}|20\d{2})\b", normalized):
+        min_year = int(year_match.group(1))
+    elif year_match := re.search(r"\b(?:before|until|through)\s+(19\d{2}|20\d{2})\b", normalized):
+        max_year = int(year_match.group(1))
+
+    max_runtime = None
+    if runtime_match := re.search(r"\bunder\s+(\d{2,3})\s*(?:min|mins|minute|minutes)\b", normalized):
+        max_runtime = int(runtime_match.group(1))
+    elif runtime_match := re.search(r"\bunder\s+(\d+)\s+hours?\b", normalized):
+        max_runtime = int(runtime_match.group(1)) * 60
+
+    min_vote_average = None
+    if rating_match := re.search(r"\b(?:rated|rating|score)\s+(?:above|over|at least)\s+(\d(?:\.\d)?)\b", normalized):
+        min_vote_average = float(rating_match.group(1))
     return {
         "text": normalized,
         "tokens": _tokenize(normalized),
@@ -405,7 +456,89 @@ def _extract_preference_signals(preferences: str) -> dict:
         "prefers_recent": any(_contains_phrase(normalized, term) for term in RECENT_TERMS),
         "prefers_older": any(_contains_phrase(normalized, term) for term in OLDER_TERMS),
         "wants_classic": any(_contains_phrase(normalized, term) for term in CLASSIC_TERMS),
+        "min_year": min_year,
+        "max_year": max_year,
+        "max_runtime": max_runtime,
+        "min_vote_average": min_vote_average,
+        "prefer_history": any(
+            phrase in normalized
+            for phrase in (
+                "like my history",
+                "similar to my history",
+                "based on my history",
+                "similar to what i watched",
+                "like what i watched",
+            )
+        ),
+        "strict_constraints": [],
+        "must_terms": set(),
+        "avoid_terms": set(),
+        "expanded_query": normalized,
+        "expansion_genres": set(),
+        "expansion_moods": set(),
+        "expansion_themes": set(),
+        "expansion_languages": set(),
+        "expansion_countries": set(),
+        "semantic_must_terms": set(),
     }
+
+
+def _merge_query_expansion_into_signals(
+    signals: dict, expansion: dict[str, object]
+) -> dict:
+    merged = dict(signals)
+    expanded_query = _normalize_text(str(expansion.get("expanded_query", "")))
+    if expanded_query:
+        merged["expanded_query"] = expanded_query
+
+    expansion_genres = set(expansion.get("genres", []) or [])
+    expansion_moods = set(expansion.get("moods", []) or [])
+    expansion_themes = set(expansion.get("themes", []) or [])
+    expansion_languages = set(expansion.get("languages", []) or [])
+    expansion_countries = set(expansion.get("countries", []) or [])
+    avoid_terms = set(expansion.get("avoid_terms", []) or [])
+    strict_constraints = list(expansion.get("strict_constraints", []) or [])
+    must_terms = set(expansion.get("must_terms", []) or [])
+
+    merged["avoid_terms"] = set(merged.get("avoid_terms", set())) | avoid_terms
+    merged["expansion_genres"] = expansion_genres
+    merged["expansion_moods"] = expansion_moods
+    merged["expansion_themes"] = expansion_themes
+    merged["expansion_languages"] = expansion_languages
+    merged["expansion_countries"] = expansion_countries
+    merged["strict_constraints"] = list(dict.fromkeys(merged.get("strict_constraints", []) + strict_constraints))
+    merged["semantic_must_terms"] = must_terms
+    merged["must_terms"] = set(merged.get("must_terms", set())) | must_terms
+
+    expansion_min_year = expansion.get("min_year")
+    expansion_max_year = expansion.get("max_year")
+    expansion_max_runtime = expansion.get("max_runtime")
+    expansion_min_vote_average = expansion.get("min_vote_average")
+
+    if isinstance(expansion_min_year, int) and merged.get("min_year") is None:
+        merged["min_year"] = expansion_min_year
+    if isinstance(expansion_max_year, int) and merged.get("max_year") is None:
+        merged["max_year"] = expansion_max_year
+    if isinstance(expansion_max_runtime, int) and merged.get("max_runtime") is None:
+        merged["max_runtime"] = expansion_max_runtime
+    if isinstance(expansion_min_vote_average, (int, float)) and merged.get("min_vote_average") is None:
+        merged["min_vote_average"] = float(expansion_min_vote_average)
+
+    merged["prefer_history"] = bool(merged.get("prefer_history")) or bool(expansion.get("prefer_history"))
+
+    for term in avoid_terms:
+        neg_genres, _ = _extract_categorical_signals(f"not {term}", GENRE_TERMS)
+        neg_moods, _ = _extract_categorical_signals(f"not {term}", MOOD_TERMS)
+        neg_themes, _ = _extract_categorical_signals(f"not {term}", THEME_TERMS)
+        neg_langs, _ = _extract_categorical_signals(f"not {term}", LANGUAGE_TERMS)
+        neg_countries, _ = _extract_categorical_signals(f"not {term}", COUNTRY_TERMS)
+        merged["avoided_genres"] = set(merged["avoided_genres"]) | neg_genres
+        merged["avoided_moods"] = set(merged["avoided_moods"]) | neg_moods
+        merged["avoided_themes"] = set(merged["avoided_themes"]) | neg_themes
+        merged["avoided_languages"] = set(merged["avoided_languages"]) | neg_langs
+        merged["avoided_countries"] = set(merged["avoided_countries"]) | neg_countries
+
+    return merged
 
 
 def _quality_prior(vote_average: float, vote_count: float, popularity: float) -> float:
@@ -427,6 +560,422 @@ def _build_movie_document(row) -> str:
         getattr(row, "top_cast", ""),
     ]
     return _normalize_text(" ".join(str(part) for part in parts if part and not pd.isna(part)))
+
+
+def _get_ollama_client() -> ollama.Client | None:
+    api_key = os.getenv("OLLAMA_API_KEY", "").strip()
+    if not api_key:
+        return None
+    return ollama.Client(
+        host="https://ollama.com",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+
+
+def _query_expansion_cache_get(key: str) -> dict[str, object] | None:
+    cached = QUERY_EXPANSION_CACHE.get(key)
+    if cached is None:
+        return None
+    QUERY_EXPANSION_CACHE.move_to_end(key)
+    return dict(cached)
+
+
+def _query_expansion_cache_set(key: str, value: dict[str, object]) -> None:
+    QUERY_EXPANSION_CACHE[key] = dict(value)
+    QUERY_EXPANSION_CACHE.move_to_end(key)
+    if len(QUERY_EXPANSION_CACHE) > QUERY_EXPANSION_CACHE_SIZE:
+        QUERY_EXPANSION_CACHE.popitem(last=False)
+
+
+def _build_query_expansion_prompt(preferences: str) -> str:
+    allowed_genres = ", ".join(sorted(GENRE_TERMS))
+    allowed_moods = ", ".join(sorted(MOOD_TERMS))
+    allowed_themes = ", ".join(sorted(THEME_TERMS))
+    allowed_languages = ", ".join(sorted(LANGUAGE_TERMS))
+    allowed_countries = ", ".join(sorted(COUNTRY_TERMS))
+    return f"""Understand this movie request and convert it into structured intent for retrieval and ranking.
+
+Original request:
+{preferences.strip() or "No preference provided."}
+
+Instructions:
+- Return valid JSON only.
+- Fill `expanded_query` with a richer retrieval query than the user wrote.
+- Extract the actual important meaning of the prompt, not just keyword overlap.
+- Put hard requirements in the numeric fields and `strict_constraints`.
+- Use only these canonical genres when applicable: {allowed_genres}
+- Use only these canonical moods when applicable: {allowed_moods}
+- Use only these canonical themes when applicable: {allowed_themes}
+- Use only these language codes when applicable: {allowed_languages}
+- Use only these canonical countries when applicable: {allowed_countries}
+- Use `must_terms` for important topical concepts that should be present in the movie metadata when possible, such as christmas, holiday, courtroom, spy, vampire, cooking, dance.
+- Put explicit negatives in `avoid_terms`.
+- Add short retrieval phrases and synonyms that help ranking.
+- Set `prefer_history` to true when the user is vague or when matching their history should matter more.
+- Do not explain your reasoning.
+
+Return JSON with this exact shape:
+{{
+  "expanded_query": "string",
+  "genres": ["genre"],
+  "moods": ["mood"],
+  "themes": ["theme"],
+  "languages": ["code"],
+  "countries": ["country"],
+  "must_terms": ["short phrase"],
+  "avoid_terms": ["short phrase"],
+  "min_year": 2023,
+  "max_year": null,
+  "max_runtime": 120,
+  "min_vote_average": 7.5,
+  "prefer_history": false,
+  "strict_constraints": ["short string"]
+}}
+
+Examples:
+Input: comfort movie after work
+Output:
+{{
+  "expanded_query": "comfort movie after work warm uplifting easy watch low stress heartwarming family friendly avoid dark avoid tragedy",
+  "genres": ["Comedy", "Family"],
+  "moods": ["feel_good", "light"],
+  "themes": [],
+  "languages": [],
+  "countries": [],
+  "must_terms": [],
+  "avoid_terms": ["dark", "tragedy"],
+  "min_year": null,
+  "max_year": null,
+  "max_runtime": 125,
+  "min_vote_average": null,
+  "prefer_history": true,
+  "strict_constraints": ["comforting tone"]
+}}
+
+Input: i love superheroes and feel-good buddy cop stories
+Output:
+{{
+  "expanded_query": "superhero action comic book team up buddy dynamic fun high energy feel good blockbuster",
+  "genres": ["Action", "Comedy", "Science Fiction"],
+  "moods": ["funny", "feel_good"],
+  "themes": ["superhero"],
+  "languages": [],
+  "countries": [],
+  "must_terms": ["buddy dynamic", "team up"],
+  "avoid_terms": [],
+  "min_year": null,
+  "max_year": null,
+  "max_runtime": null,
+  "min_vote_average": null,
+  "prefer_history": false,
+  "strict_constraints": ["superhero"]
+}}
+
+Input: i want to watch a romance movie released since 2023 and christmas themed
+Output:
+{{
+  "expanded_query": "recent christmas romance holiday themed warm festive love story released since 2023",
+  "genres": ["Romance"],
+  "moods": ["romantic", "feel_good"],
+  "themes": [],
+  "languages": [],
+  "countries": [],
+  "must_terms": ["christmas", "holiday", "festive"],
+  "avoid_terms": [],
+  "min_year": 2023,
+  "max_year": null,
+  "max_runtime": null,
+  "min_vote_average": null,
+  "prefer_history": false,
+  "strict_constraints": ["year >= 2023", "christmas theme"]
+}}
+"""
+
+
+def _coerce_allowed_labels(values: object, allowed: set[str]) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_text(value)
+        if not normalized:
+            continue
+        for label in allowed:
+            if _normalize_text(label) == normalized and label not in seen:
+                cleaned.append(label)
+                seen.add(label)
+                break
+    return cleaned
+
+
+def _coerce_avoid_terms(values: object) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_text(value)
+        if not normalized or normalized in seen:
+            continue
+        cleaned.append(normalized)
+        seen.add(normalized)
+    return cleaned[:8]
+
+
+def _coerce_int(value: object, *, minimum: int | None = None, maximum: int | None = None) -> int | None:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minimum is not None and coerced < minimum:
+        return None
+    if maximum is not None and coerced > maximum:
+        return None
+    return coerced
+
+
+def _coerce_float(value: object, *, minimum: float | None = None, maximum: float | None = None) -> float | None:
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    if minimum is not None and coerced < minimum:
+        return None
+    if maximum is not None and coerced > maximum:
+        return None
+    return coerced
+
+
+def _extract_json_object(text: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _normalize_query_expansion_response(
+    preferences: str, payload: dict[str, object] | None
+) -> dict[str, object]:
+    normalized_preferences = _normalize_text(preferences)
+    expanded_query = normalized_preferences
+    genres: list[str] = []
+    moods: list[str] = []
+    themes: list[str] = []
+    languages: list[str] = []
+    countries: list[str] = []
+    avoid_terms: list[str] = []
+    min_year = None
+    max_year = None
+    max_runtime = None
+    min_vote_average = None
+    prefer_history = False
+    strict_constraints: list[str] = []
+    must_terms: list[str] = []
+
+    if payload:
+        expanded_raw = _normalize_text(payload.get("expanded_query", ""))
+        if expanded_raw:
+            expanded_query = expanded_raw
+        genres = _coerce_allowed_labels(payload.get("genres"), set(GENRE_TERMS))
+        moods = _coerce_allowed_labels(payload.get("moods"), set(MOOD_TERMS))
+        themes = _coerce_allowed_labels(payload.get("themes"), set(THEME_TERMS))
+        languages = _coerce_allowed_labels(payload.get("languages"), set(LANGUAGE_TERMS))
+        countries = _coerce_allowed_labels(payload.get("countries"), set(COUNTRY_TERMS))
+        avoid_terms = _coerce_avoid_terms(payload.get("avoid_terms"))
+        must_terms = _coerce_avoid_terms(payload.get("must_terms"))
+        min_year = _coerce_int(payload.get("min_year"), minimum=1900, maximum=2100)
+        max_year = _coerce_int(payload.get("max_year"), minimum=1900, maximum=2100)
+        max_runtime = _coerce_int(payload.get("max_runtime"), minimum=40, maximum=400)
+        min_vote_average = _coerce_float(payload.get("min_vote_average"), minimum=0.0, maximum=10.0)
+        prefer_history = bool(payload.get("prefer_history"))
+        strict_constraints = _coerce_avoid_terms(payload.get("strict_constraints"))
+
+    parts: list[str] = []
+    seen_parts: set[str] = set()
+    for part in [
+        normalized_preferences,
+        expanded_query,
+        " ".join(genres),
+        " ".join(moods),
+        " ".join(themes),
+        " ".join(languages),
+        " ".join(countries),
+        " ".join(must_terms),
+        " ".join(avoid_terms),
+        " ".join(strict_constraints),
+    ]:
+        normalized_part = _normalize_text(part)
+        if not normalized_part or normalized_part in seen_parts:
+            continue
+        seen_parts.add(normalized_part)
+        parts.append(normalized_part)
+
+    merged_query = _normalize_text(" ".join(parts))
+    return {
+        "expanded_query": merged_query or normalized_preferences,
+        "genres": genres,
+        "moods": moods,
+        "themes": themes,
+        "languages": languages,
+        "countries": countries,
+        "must_terms": must_terms,
+        "avoid_terms": avoid_terms,
+        "min_year": min_year,
+        "max_year": max_year,
+        "max_runtime": max_runtime,
+        "min_vote_average": min_vote_average,
+        "prefer_history": prefer_history,
+        "strict_constraints": strict_constraints,
+    }
+
+
+def _fallback_query_expansion(preferences: str) -> dict[str, object]:
+    signals = _extract_preference_signals(preferences)
+    query_parts = [signals["text"]]
+
+    query_parts.extend(genre.lower() for genre in sorted(signals["preferred_genres"]))
+    query_parts.extend(mood.replace("_", " ") for mood in sorted(signals["preferred_moods"]))
+    query_parts.extend(theme.replace("_", " ") for theme in sorted(signals["preferred_themes"]))
+
+    avoid_terms = set()
+    for genre in sorted(signals["avoided_genres"]):
+        avoid_terms.add(genre.lower())
+    for mood in sorted(signals["avoided_moods"]):
+        avoid_terms.add(mood.replace("_", " "))
+    for theme in sorted(signals["avoided_themes"]):
+        avoid_terms.add(theme.replace("_", " "))
+
+    if signals["wants_comfort"]:
+        query_parts.extend(["warm", "uplifting", "easy watch", "low stress"])
+        avoid_terms.update({"dark", "tragedy"})
+    if signals["wants_date_night"]:
+        query_parts.extend(["date night", "chemistry", "warm romance"])
+    if signals["wants_musical"]:
+        query_parts.extend(["music", "performance", "singing"])
+    if signals["wants_high_rated"]:
+        query_parts.extend(["highly rated", "acclaimed"])
+    if signals["wants_family_friendly"]:
+        query_parts.extend(["family friendly", "all ages"])
+    if signals["avoids_sad"]:
+        avoid_terms.update({"tragedy", "heartbreak", "grief"})
+
+    used_tokens = set()
+    for group in (
+        signals["preferred_genres"],
+        signals["avoided_genres"],
+        signals["preferred_moods"],
+        signals["avoided_moods"],
+        signals["preferred_themes"],
+        signals["avoided_themes"],
+        signals["preferred_languages"],
+        signals["preferred_countries"],
+    ):
+        for label in group:
+            used_tokens.update(_tokenize(_normalize_text(label)))
+    used_tokens.update(_tokenize(" ".join(avoid_terms)))
+
+    must_terms = []
+    for token in signals["tokens"]:
+        if token in used_tokens or token in GENERIC_QUERY_FILLER or token.isdigit():
+            continue
+        if len(token) < 4:
+            continue
+        must_terms.append(token)
+    must_terms = must_terms[:3]
+    query_parts.extend(must_terms)
+
+    expanded_query = _normalize_text(
+        " ".join(query_parts + [f"avoid {term}" for term in sorted(avoid_terms)])
+    )
+    return {
+        "expanded_query": expanded_query or signals["text"],
+        "genres": sorted(signals["preferred_genres"]),
+        "moods": sorted(signals["preferred_moods"]),
+        "themes": sorted(signals["preferred_themes"]),
+        "languages": sorted(signals["preferred_languages"]),
+        "countries": sorted(signals["preferred_countries"]),
+        "must_terms": must_terms,
+        "avoid_terms": sorted(avoid_terms),
+        "min_year": signals["min_year"],
+        "max_year": signals["max_year"],
+        "max_runtime": signals["max_runtime"],
+        "min_vote_average": signals["min_vote_average"],
+        "prefer_history": signals["prefer_history"],
+        "strict_constraints": list(signals["strict_constraints"]),
+    }
+
+
+def _expand_preferences_for_retrieval(preferences: str) -> dict[str, object]:
+    normalized = _normalize_text(preferences)
+    if not normalized:
+        return {
+            "expanded_query": normalized,
+            "genres": [],
+            "moods": [],
+            "themes": [],
+            "languages": [],
+            "countries": [],
+            "must_terms": [],
+            "avoid_terms": [],
+            "min_year": None,
+            "max_year": None,
+            "max_runtime": None,
+            "min_vote_average": None,
+            "prefer_history": False,
+            "strict_constraints": [],
+        }
+
+    cached = _query_expansion_cache_get(normalized)
+    if cached is not None:
+        return cached
+
+    client = _get_ollama_client()
+    if client is None:
+        fallback = _fallback_query_expansion(preferences)
+        _query_expansion_cache_set(normalized, fallback)
+        return fallback
+
+    try:
+        response = client.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": _build_query_expansion_prompt(preferences)}],
+            format="json",
+            options={"temperature": 0.2, "num_predict": QUERY_EXPANSION_NUM_PREDICT},
+        )
+        payload = _extract_json_object(str(response.message.content).strip())
+    except Exception:
+        payload = None
+
+    normalized_expansion = _normalize_query_expansion_response(preferences, payload)
+    if (
+        _normalize_text(str(normalized_expansion["expanded_query"])) == normalized
+        and not normalized_expansion["genres"]
+        and not normalized_expansion["moods"]
+        and not normalized_expansion["themes"]
+        and not normalized_expansion["languages"]
+        and not normalized_expansion["countries"]
+        and not normalized_expansion["must_terms"]
+        and not normalized_expansion["avoid_terms"]
+        and normalized_expansion["min_year"] is None
+        and normalized_expansion["max_year"] is None
+        and normalized_expansion["max_runtime"] is None
+        and normalized_expansion["min_vote_average"] is None
+        and not normalized_expansion["strict_constraints"]
+    ):
+        normalized_expansion = _fallback_query_expansion(preferences)
+    _query_expansion_cache_set(normalized, normalized_expansion)
+    return normalized_expansion
 
 
 def _tmdb_auth_headers() -> tuple[dict[str, str], dict[str, str]]:
@@ -675,9 +1224,30 @@ def _resolve_history_candidates(history: list[str], history_ids: list[int] | Non
 
 def _summarize_history(history_candidates: list[dict]) -> dict:
     genres = Counter()
+    aggregate_weights: Counter[str] = Counter()
+    history_vector_count = 0
     for candidate in history_candidates:
         genres.update(candidate["genres"])
-    return {"count": len(history_candidates), "genres": genres}
+        aggregate_weights.update(candidate["tfidf_weights"])
+        history_vector_count += 1
+
+    centroid_weights: dict[str, float] = {}
+    if history_vector_count:
+        centroid_weights = {
+            token: weight / history_vector_count
+            for token, weight in aggregate_weights.items()
+        }
+    centroid_norm = math.sqrt(
+        sum(weight * weight for weight in centroid_weights.values())
+    ) or 1.0
+
+    return {
+        "count": len(history_candidates),
+        "genres": genres,
+        "candidates": history_candidates,
+        "tfidf_weights": centroid_weights,
+        "tfidf_norm": centroid_norm,
+    }
 
 
 def _build_query_tfidf(preferences: str) -> tuple[dict[str, float], float]:
@@ -757,6 +1327,11 @@ def _mood_bonus(candidate: dict, signals: dict) -> float:
 def _runtime_bonus(candidate: dict, signals: dict) -> float:
     runtime = candidate["runtime_min"]
     score = 0.0
+    if signals.get("max_runtime") and runtime:
+        if runtime <= signals["max_runtime"]:
+            score += 1.4
+        else:
+            score -= min(4.0, (runtime - signals["max_runtime"]) * 0.06)
     if signals["wants_short"]:
         if 0 < runtime <= 105:
             score += 0.9
@@ -809,6 +1384,16 @@ def _locale_bonus(candidate: dict, signals: dict) -> float:
 def _year_bonus(candidate: dict, signals: dict) -> float:
     year = candidate["year"]
     score = 0.0
+    if signals.get("min_year"):
+        if year >= signals["min_year"]:
+            score += 1.8 + min(1.5, (year - signals["min_year"]) * 0.05)
+        else:
+            score -= min(5.0, (signals["min_year"] - year) * 0.18)
+    if signals.get("max_year"):
+        if year <= signals["max_year"]:
+            score += 1.0
+        else:
+            score -= min(4.0, (year - signals["max_year"]) * 0.16)
     if signals["prefers_recent"]:
         if year >= 2020:
             score += 1.8 + (year - 2020) * 0.08
@@ -835,6 +1420,34 @@ def _year_bonus(candidate: dict, signals: dict) -> float:
     return score
 
 
+def _query_is_generic(signals: dict) -> bool:
+    explicit_preferences = 0
+    explicit_preferences += len(signals["preferred_genres"]) + len(signals["avoided_genres"])
+    explicit_preferences += len(signals["preferred_moods"]) + len(signals["avoided_moods"])
+    explicit_preferences += len(signals["preferred_themes"]) + len(signals["avoided_themes"])
+    explicit_preferences += len(signals["preferred_languages"]) + len(signals["preferred_countries"])
+    explicit_preferences += len(signals["must_terms"]) + len(signals.get("semantic_must_terms", set()))
+    explicit_preferences += len(signals["avoid_terms"])
+    explicit_preferences += int(signals.get("min_year") is not None)
+    explicit_preferences += int(signals.get("max_year") is not None)
+    explicit_preferences += int(signals.get("max_runtime") is not None)
+    explicit_preferences += int(signals.get("min_vote_average") is not None)
+    explicit_preferences += int(signals.get("prefer_history"))
+    explicit_preferences += int(signals["wants_musical"])
+    explicit_preferences += int(signals["wants_date_night"])
+    explicit_preferences += int(signals["avoids_sad"])
+    explicit_preferences += int(signals["wants_comfort"])
+    explicit_preferences += int(signals["wants_family_friendly"])
+    explicit_preferences += int(signals["wants_high_rated"])
+    explicit_preferences += int(signals["wants_short"])
+    explicit_preferences += int(signals["wants_long"])
+    explicit_preferences += int(signals["wants_fast"])
+    explicit_preferences += int(signals["prefers_recent"])
+    explicit_preferences += int(signals["prefers_older"])
+    explicit_preferences += int(signals["wants_classic"])
+    return explicit_preferences == 0 and len(signals["tokens"]) <= 2
+
+
 def _history_bonus(candidate: dict, history_summary: dict) -> float:
     if not history_summary["count"]:
         return 0.0
@@ -845,8 +1458,67 @@ def _history_bonus(candidate: dict, history_summary: dict) -> float:
     return min(1.2, overlap * 0.35)
 
 
+def _history_similarity_bonus(candidate: dict, history_summary: dict, signals: dict) -> float:
+    if not history_summary["count"]:
+        return 0.0
+
+    centroid_similarity = _tfidf_similarity(
+        history_summary["tfidf_weights"],
+        history_summary["tfidf_norm"],
+        candidate,
+    )
+    max_item_similarity = 0.0
+    for history_candidate in history_summary["candidates"]:
+        max_item_similarity = max(
+            max_item_similarity,
+            _tfidf_similarity(
+                history_candidate["tfidf_weights"],
+                history_candidate["tfidf_norm"],
+                candidate,
+            ),
+        )
+
+    if _query_is_generic(signals):
+        base_weight = 7.0
+        item_weight = 3.0
+    else:
+        query_specificity = len(signals["preferred_genres"]) + len(signals["preferred_moods"])
+        query_specificity += len(signals["preferred_themes"]) + len(signals["preferred_languages"])
+        query_specificity += len(signals["preferred_countries"])
+        base_weight = 4.2 if query_specificity <= 1 else 3.2
+        item_weight = 1.8
+
+    if signals.get("prefer_history"):
+        base_weight += 2.2
+        item_weight += 1.2
+
+    return (base_weight * centroid_similarity) + (item_weight * max_item_similarity)
+
+
 def _hard_constraint_penalty(candidate: dict, signals: dict) -> float:
     penalty = 0.0
+    if signals.get("must_terms"):
+        matched_terms = sum(
+            1 for term in signals["must_terms"] if _contains_phrase(candidate["document"], term)
+        )
+        if matched_terms == 0:
+            penalty -= 4.5
+        elif matched_terms < len(signals["must_terms"]):
+            penalty -= 0.8
+    elif signals.get("semantic_must_terms"):
+        matched_terms = sum(
+            1 for term in signals["semantic_must_terms"] if _contains_phrase(candidate["document"], term)
+        )
+        if matched_terms == 0:
+            penalty -= 1.2
+    if signals.get("min_year") and candidate["year"] < signals["min_year"]:
+        penalty -= 6.5
+    if signals.get("max_year") and candidate["year"] > signals["max_year"]:
+        penalty -= 5.0
+    if signals.get("max_runtime") and candidate["runtime_min"] and candidate["runtime_min"] > signals["max_runtime"]:
+        penalty -= 4.5
+    if signals.get("min_vote_average") and candidate["vote_average"] < signals["min_vote_average"]:
+        penalty -= 3.5
     if "superhero" in signals["avoided_themes"] and candidate["is_superhero"]:
         penalty -= 8.0
     if signals["prefers_recent"] and candidate["year"] < 2015:
@@ -874,11 +1546,25 @@ def _hard_constraint_penalty(candidate: dict, signals: dict) -> float:
             penalty -= 2.8
     if signals["preferred_countries"] and not (candidate["countries"] & signals["preferred_countries"]):
         penalty -= 2.0
+    for term in signals.get("avoid_terms", set()):
+        if _contains_phrase(candidate["document"], term):
+            penalty -= 1.6
     return penalty
 
 
 def _special_request_bonus(candidate: dict, signals: dict) -> float:
     score = 0.0
+
+    if signals.get("must_terms"):
+        matched_terms = [
+            term for term in signals["must_terms"] if _contains_phrase(candidate["document"], term)
+        ]
+        score += min(3.6, 1.4 * len(matched_terms))
+    elif signals.get("semantic_must_terms"):
+        matched_terms = [
+            term for term in signals["semantic_must_terms"] if _contains_phrase(candidate["document"], term)
+        ]
+        score += min(1.6, 0.8 * len(matched_terms))
 
     if signals["wants_musical"]:
         if candidate["musical_strength"] >= 2.0:
@@ -934,6 +1620,12 @@ def _special_request_bonus(candidate: dict, signals: dict) -> float:
         elif candidate["vote_average"] < 6.8:
             score -= 1.4
 
+    if signals.get("min_vote_average") is not None:
+        if candidate["vote_average"] >= signals["min_vote_average"]:
+            score += 1.2
+        elif candidate["vote_average"] >= max(0.0, signals["min_vote_average"] - 0.4):
+            score += 0.2
+
     if (
         "Thriller" in signals["preferred_genres"]
         and ("Horror" in signals["avoided_genres"] or "scary" in signals["avoided_moods"])
@@ -943,6 +1635,25 @@ def _special_request_bonus(candidate: dict, signals: dict) -> float:
         if "Horror" in candidate["genres"] or candidate["is_dark"]:
             score -= 1.6
 
+    return score
+
+
+def _semantic_hint_bonus(candidate: dict, signals: dict) -> float:
+    score = 0.0
+    score += 0.35 * len(candidate["genres"] & signals.get("expansion_genres", set()))
+    if signals.get("expansion_moods"):
+        if "dark" in signals["expansion_moods"] and candidate["is_dark"]:
+            score += 0.25
+        if "light" in signals["expansion_moods"] and candidate["is_light"]:
+            score += 0.25
+        if "feel_good" in signals["expansion_moods"] and candidate["is_light"]:
+            score += 0.2
+    if "superhero" in signals.get("expansion_themes", set()) and candidate["is_superhero"]:
+        score += 0.35
+    if signals.get("expansion_languages") and candidate["original_language"] in signals["expansion_languages"]:
+        score += 0.3
+    if signals.get("expansion_countries") and candidate["countries"] & signals["expansion_countries"]:
+        score += 0.3
     return score
 
 
@@ -964,7 +1675,9 @@ def _score_candidate(
         + _locale_bonus(candidate, signals)
         + _year_bonus(candidate, signals)
         + _history_bonus(candidate, history_summary)
+        + _history_similarity_bonus(candidate, history_summary, signals)
         + _special_request_bonus(candidate, signals)
+        + _semantic_hint_bonus(candidate, signals)
         + _hard_constraint_penalty(candidate, signals)
     )
 
@@ -1027,12 +1740,14 @@ def _locale_pools(candidate_pool: list[dict], signals: dict) -> tuple[list[dict]
 def _choose_movie(
     preferences: str, history: list[str], history_ids: list[int] | None = None
 ) -> tuple[dict, str]:
-    signals = _extract_preference_signals(preferences)
+    base_signals = _extract_preference_signals(preferences)
+    expansion = _expand_preferences_for_retrieval(preferences)
+    signals = _merge_query_expansion_into_signals(base_signals, expansion)
     seen_ids = _normalize_history_ids(history_ids)
     seen_titles = _normalize_history_titles(history)
     history_candidates = _resolve_history_candidates(history, history_ids)
     history_summary = _summarize_history(history_candidates)
-    query_weights, query_norm = _build_query_tfidf(preferences)
+    query_weights, query_norm = _build_query_tfidf(str(signals["expanded_query"]))
 
     if signals["wants_classic"]:
         candidate_pool = [
@@ -1046,6 +1761,33 @@ def _choose_movie(
             candidate_pool = CANDIDATES
     else:
         candidate_pool = CANDIDATES
+
+    constrained_pool = candidate_pool
+    if signals.get("min_year") is not None:
+        filtered = [candidate for candidate in constrained_pool if candidate["year"] >= signals["min_year"]]
+        if filtered:
+            constrained_pool = filtered
+    if signals.get("max_year") is not None:
+        filtered = [candidate for candidate in constrained_pool if candidate["year"] <= signals["max_year"]]
+        if filtered:
+            constrained_pool = filtered
+    if signals.get("max_runtime") is not None:
+        filtered = [
+            candidate
+            for candidate in constrained_pool
+            if candidate["runtime_min"] and candidate["runtime_min"] <= signals["max_runtime"]
+        ]
+        if len(filtered) >= 5:
+            constrained_pool = filtered
+    if signals.get("min_vote_average") is not None:
+        filtered = [
+            candidate
+            for candidate in constrained_pool
+            if candidate["vote_average"] >= signals["min_vote_average"]
+        ]
+        if len(filtered) >= 5:
+            constrained_pool = filtered
+    candidate_pool = constrained_pool
 
     geo_notice = ""
     if signals["preferred_languages"] or signals["preferred_countries"]:
@@ -1083,6 +1825,29 @@ def _choose_movie(
         reverse=True,
     )
     return ranked[0][1], geo_notice
+
+
+def inspect_query_expansion(preferences: str) -> dict[str, object]:
+    signals = _extract_preference_signals(preferences)
+    expansion = _expand_preferences_for_retrieval(preferences)
+    merged = _merge_query_expansion_into_signals(signals, expansion)
+    return {
+        "original": _normalize_text(preferences),
+        "expanded_query": merged["expanded_query"],
+        "genres": sorted(merged["expansion_genres"]),
+        "moods": sorted(merged["expansion_moods"]),
+        "themes": sorted(merged["expansion_themes"]),
+        "languages": sorted(merged["expansion_languages"]),
+        "countries": sorted(merged["expansion_countries"]),
+        "must_terms": sorted(set(merged["must_terms"]) | set(merged.get("semantic_must_terms", set()))),
+        "avoid_terms": sorted(merged["avoid_terms"]),
+        "min_year": merged["min_year"],
+        "max_year": merged["max_year"],
+        "max_runtime": merged["max_runtime"],
+        "min_vote_average": merged["min_vote_average"],
+        "prefer_history": merged["prefer_history"],
+        "strict_constraints": merged["strict_constraints"],
+    }
 
 
 def _truncate_text(text: str, limit: int = MAX_DESCRIPTION_CHARS) -> str:
@@ -1230,15 +1995,11 @@ Catalog limitation note:
 
 def _generate_description(candidate: dict, preferences: str, prefix_notice: str = "") -> str:
     candidate = _enrich_candidate_with_tmdb(candidate)
-    api_key = os.getenv("OLLAMA_API_KEY", "").strip()
-    if not api_key:
+    client = _get_ollama_client()
+    if client is None:
         return _fallback_description(candidate, preferences, prefix_notice)
 
     try:
-        client = ollama.Client(
-            host="https://ollama.com",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
         response = client.chat(
             model=MODEL,
             messages=[{"role": "user", "content": _build_description_prompt(candidate, preferences, prefix_notice)}],
@@ -1339,6 +2100,28 @@ if __name__ == "__main__":
         [t.strip() for t in history_raw.split(",") if t.strip()]
         if history_raw
         else []
+    )
+
+    debug_expansion = inspect_query_expansion(preferences)
+    print("\nRetrieval query:")
+    print(debug_expansion["expanded_query"])
+    print("Structured tags:")
+    print(
+        {
+            "genres": debug_expansion["genres"],
+            "moods": debug_expansion["moods"],
+            "themes": debug_expansion["themes"],
+            "languages": debug_expansion["languages"],
+            "countries": debug_expansion["countries"],
+            "must_terms": debug_expansion["must_terms"],
+            "avoid_terms": debug_expansion["avoid_terms"],
+            "min_year": debug_expansion["min_year"],
+            "max_year": debug_expansion["max_year"],
+            "max_runtime": debug_expansion["max_runtime"],
+            "min_vote_average": debug_expansion["min_vote_average"],
+            "prefer_history": debug_expansion["prefer_history"],
+            "strict_constraints": debug_expansion["strict_constraints"],
+        }
     )
 
     print("\nThinking...\n")
